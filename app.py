@@ -21,6 +21,8 @@ FASES = {  # fase: (lista em que começa, lista em que é entregue)
 }
 LISTA_DIRETORIA = "Aprovação de Matriz Diretoria"
 ETIQUETA_GERENTE = "Check Gerencial"
+LISTA_MERCADO = "Análise de Mercado"  # usada só se o cartão não tiver o checklist "dd/mm - Direcionado ao mercado"
+CAMPOS_DESC = ["Atual", "Valor Atual", "Vidas", "Consultora", "CNPJ", "Gestor", "Oper Ofer", "Valor Ofer"]
 PORTES = [(2, 29, "PME", 2), (30, 99, "PME PLUS", 2), (100, 499, "MIDDLE", 10),
           (500, 999, "MIDDLE PLUS", 10), (1000, 10**9, "CORPORATE", 10)]  # (de, até, porte, SLA em dias úteis)
 UF_FERIADOS = None  # ex.: "SP" para somar feriados estaduais aos nacionais
@@ -68,6 +70,50 @@ def vidas_porte(desc):
     return v, None, None
 
 
+def campos_desc(desc):  # linhas "- Atual: valor" -> {"Atual": "valor", ...}
+    out, chaves = dict.fromkeys(CAMPOS_DESC, ""), {norm(k): k for k in CAMPOS_DESC}
+    for linha in (desc or "").splitlines():
+        rot, sep, val = re.sub(r"^[\s\-\*•]+", "", linha).replace("**", "").partition(":")
+        if sep and norm(rot) in chaves:
+            out[chaves[norm(rot)]] = val.strip()
+    return out
+
+
+def direcionamento(c, criado, entradas):  # data do checklist "dd/mm - Direcionado ao mercado"
+    for ck in c["checklists"]:
+        m = RE_ITEM.match(ck["name"])
+        if m and "direcionado ao mercado" in norm(ck["name"]):
+            d = mk(*m.group(1, 2, 3), criado.date(), 60)
+            if d:
+                return d
+    return next((t.date() for t, n in entradas if n == norm(LISTA_MERCADO)), None)  # plano B: entrada na lista
+
+
+ACOES = {"createCard": "Criou o cartão", "copyCard": "Copiou o cartão", "addChecklistToCard": "Adicionou checklist",
+         "removeChecklistFromCard": "Removeu checklist", "createCheckItem": "Criou item", "updateCheckItem": "Editou item",
+         "deleteCheckItem": "Excluiu item", "addMemberToCard": "Adicionou membro", "removeMemberFromCard": "Removeu membro",
+         "addLabelToCard": "Adicionou etiqueta", "removeLabelFromCard": "Removeu etiqueta",
+         "addAttachmentToCard": "Adicionou anexo", "deleteAttachmentFromCard": "Removeu anexo"}
+CAMPOS_CARD = {"desc": "Editou a descrição", "due": "Alterou a data de entrega", "start": "Alterou a data de início",
+               "name": "Renomeou o cartão", "closed": "Arquivou/desarquivou o cartão",
+               "dueComplete": "Marcou/desmarcou a entrega como concluída"}
+
+
+def descrever(a):  # texto curto da ação do histórico (Actions)
+    d, t = a["data"], a["type"]
+    if t == "updateCard":
+        if d.get("listAfter"):
+            return f'Moveu de "{d["listBefore"]["name"]}" para "{d["listAfter"]["name"]}"'
+        return next((txt for k, txt in CAMPOS_CARD.items() if k in d.get("old", {})), "Atualizou o cartão")
+    if t == "commentCard":
+        return "Comentou: " + d.get("text", "")[:150]
+    base = ACOES.get(t, t)
+    if t == "updateCheckItemStateOnCard":
+        base = "Marcou item" if d["checkItem"].get("state") == "complete" else "Desmarcou item"
+    det = next((d[k]["name"] for k in ("checkItem", "checklist", "label", "attachment") if d.get(k, {}).get("name")), "")
+    return f'{base}: "{det}"' if det else base
+
+
 def api(path, **p):
     r = requests.get(f"https://api.trello.com/1{path}", timeout=60,
                      params={"key": st.secrets["TRELLO_KEY"], "token": st.secrets["TRELLO_TOKEN"], **p})
@@ -82,7 +128,7 @@ def carregar():
     cards = api(f"/boards/{b}/cards", filter="all", members="true", member_fields="fullName", checklists="all")
     acoes, antes = [], None
     while True:  # histórico de movimentações (paginado)
-        p = dict(filter="updateCard:idList,createCard,copyCard", limit=1000)
+        p = dict(filter="all", limit=1000)
         if antes:
             p["before"] = antes
         lote = api(f"/boards/{b}/actions", **p)
@@ -96,11 +142,16 @@ def carregar():
 def montar(prazo_trello, hoje):
     listas, cards, acoes = carregar()
     ev, can = {}, {}
-    for a in acoes:  # entradas em cada lista, por cartão
+    ult = {}
+    for a in acoes:  # a API devolve da ação mais nova para a mais antiga
         d = a["data"]
+        cid = d.get("card", {}).get("id")
+        if not cid:
+            continue
+        ult.setdefault(cid, a)  # primeira vista = última movimentação do cartão
         nome = (d.get("listAfter") or d.get("list") or {}).get("name")
-        if nome and "card" in d:
-            ev.setdefault(d["card"]["id"], []).append((dt(a["date"]), norm(nome)))
+        if nome and (a["type"] in ("createCard", "copyCard") or (a["type"] == "updateCard" and d.get("listAfter"))):
+            ev.setdefault(cid, []).append((dt(a["date"]), norm(nome)))  # entradas em cada lista
     C, F, O = [], [], []
     for c in cards:
         resp = [m["fullName"] for m in c["members"]] or ["Sem responsável"]
@@ -109,9 +160,19 @@ def montar(prazo_trello, hoje):
         desde = ([t for t, n in e if n == norm(atual)] or [criado])[-1]
         vidas, porte, sla = vidas_porte(c["desc"])
         due = dt(c["due"]).date() if c["due"] else None
-        C.append(dict(id=c["id"], Cartão=c["name"], Lista=atual, Resp=resp, Vidas=vidas, Porte=porte, SLA=sla,
-                      Gerente=any(norm(l["name"]) == norm(ETIQUETA_GERENTE) for l in c["labels"]),
-                      Arquivado=c["closed"], Desde=desde.replace(tzinfo=None), Link=c["shortUrl"]))
+        inicio = dt(c["start"]).date() if c.get("start") else None
+        ua = ult.get(c["id"])
+        C.append({"id": c["id"], "Cartão": c["name"], "Lista": atual, "Resp": resp,
+                  "Etiquetas": ", ".join(l["name"] or l["color"] or "" for l in c["labels"]),
+                  **campos_desc(c["desc"]),  # Atual, Valor Atual, Vidas, Consultora, CNPJ, Gestor, Oper Ofer, Valor Ofer
+                  "Vidas": vidas, "Porte": porte, "SLA": sla,  # Vidas numérico (usado no cálculo do porte)
+                  "Data de Início": inicio, "Data de Entrega": due,
+                  "Data de Direcionamento": direcionamento(c, criado, e),
+                  "Última movimentação": descrever(ua) if ua else "",
+                  "Data da última movimentação": dt(ua["date"]).replace(tzinfo=None) if ua else None,
+                  "Última movimentação por": (ua.get("memberCreator") or {}).get("fullName", "") if ua else "",
+                  "Gerente": any(norm(l["name"]) == norm(ETIQUETA_GERENTE) for l in c["labels"]),
+                  "Arquivado": c["closed"], "Desde": desde.replace(tzinfo=None), "Link": c["shortUrl"]})
         for fase, (ini, fim) in FASES.items():
             t0 = next((t for t, n in e if n == norm(ini)), criado if (norm(atual) == norm(ini) and not e) else None)
             if not t0:
