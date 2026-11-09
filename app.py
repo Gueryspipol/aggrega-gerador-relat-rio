@@ -22,6 +22,17 @@ FASES = {  # fase: (lista em que começa, lista em que é entregue)
 LISTA_DIRETORIA = "Aprovação de Matriz Diretoria"
 ETIQUETA_GERENTE = "Check Gerencial"
 LISTA_MERCADO = "Análise de Mercado"  # usada só se o cartão não tiver o checklist "dd/mm - Direcionado ao mercado"
+DATA_INICIAL = date(2026, 11, 4)  # só entram cartões criados a partir desta data (fase de teste)
+ORDEM = {  # ordem padrão das colunas em cada aba do Excel (colunas fora da lista vão para o fim)
+    "Cartões": ["Cartão", "Lista", "Responsáveis", "Etiquetas", "Atual", "Valor Atual", "Vidas", "Consultora", "CNPJ",
+                "Gestor", "Oper Ofer", "Valor Ofer", "Porte", "SLA", "Data de Início", "Data de Entrega",
+                "Data de Direcionamento", "Na lista desde", "Dias úteis na lista", "Última movimentação",
+                "Data da última movimentação", "Última movimentação por", "Gerente", "Arquivado", "Link"],
+    "Fases": ["Cartão", "Fase", "Responsáveis", "Lista", "Início", "Prazo", "Entrega", "SLA", "Dias úteis",
+              "Entregue", "No prazo", "Vencida"],
+    "Operadoras": ["Cartão", "Operadora", "Envio", "Resposta", "Dias úteis", "Pendente", "Responsáveis"],
+    "Pendências": ["Cartão", "Fase", "Responsáveis", "Lista", "Causa", "Início", "Prazo", "SLA", "Dias úteis"],
+}
 JANELA_DIAS = 60  # a "última movimentação" é buscada só nos últimos X dias do histórico (bem mais rápido)
 CAMPOS_DESC = ["Atual", "Valor Atual", "Vidas", "Consultora", "CNPJ", "Gestor", "Oper Ofer", "Valor Ofer"]
 PORTES = [(2, 29, "PME", 2), (30, 99, "PME PLUS", 2), (100, 499, "MIDDLE", 10),
@@ -164,6 +175,8 @@ def montar(prazo_trello, hoje):
     for c in cards:
         resp = [m["fullName"] for m in c["members"]] or ["Sem responsável"]
         criado = datetime.fromtimestamp(int(c["id"][:8], 16), TZ)
+        if criado.date() < DATA_INICIAL:
+            continue
         e, atual = sorted(ev.get(c["id"], [])), listas.get(c["idList"], "?")
         desde = ([t for t, n in e if n == norm(atual)] or [criado])[-1]
         vidas, porte, sla = vidas_porte(c["desc"])
@@ -214,11 +227,12 @@ def montar(prazo_trello, hoje):
     return pd.DataFrame(C), pd.DataFrame(F), pd.DataFrame(O, columns=cols)
 
 
-def vis(df):  # versão amigável para tela/Excel
+def vis(df, ordem=()):  # versão amigável para tela/Excel, com as colunas na ordem padrão
     d = df.drop(columns=["id"], errors="ignore").copy()
     if "Resp" in d:
         d["Resp"] = d.Resp.map(", ".join)
-    return d.rename(columns={"Resp": "Responsáveis", "DiasUteis": "Dias úteis", "NoPrazo": "No prazo"})
+    d = d.rename(columns={"Resp": "Responsáveis", "DiasUteis": "Dias úteis", "NoPrazo": "No prazo", "Desde": "Na lista desde"})
+    return d[[c for c in ordem if c in d] + [c for c in d if c not in ordem]]
 
 
 # ---------------- TELA ----------------
@@ -234,7 +248,7 @@ if st.secrets.get("APP_PASSWORD") and st.sidebar.text_input("Senha", type="passw
 hoje = datetime.now(TZ).date()
 with st.sidebar:
     ref = st.radio("Prazo de referência", ["SLA calculado", "Data de entrega do Trello"])
-    per = st.date_input("Abertura da fase entre", (hoje - timedelta(days=90), hoje))
+    per = st.date_input("Abertura da fase entre", (DATA_INICIAL, hoje), min_value=DATA_INICIAL)
     if st.button("Atualizar agora"):
         st.cache_data.clear()
         st.rerun()
@@ -294,7 +308,7 @@ with t1:
         g = ent.explode("Resp").groupby(["Fase", "Resp"]).agg(Entregas=("NoPrazo", "size"), NoPrazo=("NoPrazo", "mean"))
         g["NoPrazo"] = (g.NoPrazo * 100).round(0)
         st.dataframe(g.rename(columns={"NoPrazo": "% no prazo"}), use_container_width=True)
-        st.dataframe(vis(ent), use_container_width=True, hide_index=True)
+        st.dataframe(vis(ent, ORDEM["Fases"]), use_container_width=True, hide_index=True)
     else:
         st.info("Ainda não há entregas com porte (campo Vidas) preenchido neste período.")
     sem = cartoes[cartoes.Vidas.isna()]
@@ -303,7 +317,7 @@ with t1:
 with t2:
     if len(venc):
         st.bar_chart(venc.explode("Resp").groupby(["Resp", "Tipo"]).size().unstack(fill_value=0))
-        st.dataframe(vis(venc.drop(columns=["Tipo"])), use_container_width=True, hide_index=True)
+        st.dataframe(vis(venc.drop(columns=["Tipo"]), ORDEM["Pendências"]), use_container_width=True, hide_index=True)
     else:
         st.success("Nenhuma pendência vencida.")
 with t3:
@@ -311,25 +325,34 @@ with t3:
         t = ops.groupby("Operadora").agg(Respondidas=("DiasUteis", "count"), Média=("DiasUteis", "mean"),
                                          Pendentes=("Pendente", "sum")).round(1).sort_values("Média")
         st.dataframe(t.rename(columns={"Média": "Média (dias úteis)"}), use_container_width=True)
-        st.dataframe(vis(ops), use_container_width=True, hide_index=True)
+        st.dataframe(vis(ops, ORDEM["Operadoras"]), use_container_width=True, hide_index=True)
     else:
         st.info("Nenhum checklist de operadoras no padrão 'dd/mm' encontrado.")
 with t4:
     if len(conc):
         g = conc.explode("Resp").groupby("Resp").agg(Cartões=("Gerente", "size"), ComGerente=("Gerente", "sum"))
         st.dataframe(g, use_container_width=True)
-        st.dataframe(vis(conc), use_container_width=True, hide_index=True)
+        st.dataframe(vis(conc, ORDEM["Cartões"]), use_container_width=True, hide_index=True)
     else:
         st.info("Ainda não há cartões entregues no período.")
 with t5:
     ab = cartoes[~cartoes.Arquivado].copy()
     ab["Dias úteis na lista"] = [du(t, hoje) for t in ab.Desde]
     st.bar_chart(ab.Lista.value_counts())
-    st.dataframe(vis(ab), use_container_width=True, hide_index=True)
+    st.dataframe(vis(ab, ORDEM["Cartões"]), use_container_width=True, hide_index=True)
 
 buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="openpyxl") as w:
     for nome, d in {"Cartões": cartoes, "Fases": fases, "Operadoras": ops, "Pendências": venc}.items():
-        vis(d).to_excel(w, sheet_name=nome, index=False)
+        vis(d, ORDEM[nome]).to_excel(w, sheet_name=nome, index=False)
+        ws = w.sheets[nome]
+        ws.freeze_panes = "A2"
+        for col in ws.columns:
+            ws.column_dimensions[col[0].column_letter].width = min(max(len(str(c.value or "")) for c in col[:300]) + 2, 45)
+            for c in col[1:]:
+                if isinstance(c.value, datetime):
+                    c.number_format = "DD/MM/YYYY HH:MM"
+                elif isinstance(c.value, date):
+                    c.number_format = "DD/MM/YYYY"
 st.sidebar.download_button("Baixar Excel", buf.getvalue(), "relatorio_demandas.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
